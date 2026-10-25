@@ -1,0 +1,311 @@
+name: CandleC Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-x86_64
+            runner: macos-15-intel
+            binary: candlec
+
+          - target: macos-aarch64
+            runner: macos-15
+            binary: candlec
+
+          - target: linux-x86_64-glibc
+            runner: ubuntu-24.04
+            binary: candlec
+
+          - target: linux-aarch64-glibc
+            runner: ubuntu-24.04-arm
+            binary: candlec
+
+          - target: windows-x86_64
+            runner: windows-2025
+            binary: candlec.exe
+
+          - target: windows-aarch64
+            runner: windows-11-arm
+            binary: candlec.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.99.1
+
+      - name: Configure Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Verify version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"] == "candlec"))')
+
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Tag version $TAG_VERSION does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Build CandleC
+        run: cargo build --release --locked
+
+      - name: Package ZIP
+        shell: bash
+        env:
+          BINARY_NAME: ${{ matrix.binary }}
+          TARGET_NAME: ${{ matrix.target }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          import zipfile
+          from pathlib import Path
+
+          root = Path.cwd()
+          binary = root / "target" / "release" / os.environ["BINARY_NAME"]
+          dist = root / "dist"
+          dist.mkdir(exist_ok=True)
+
+          if not binary.is_file():
+              raise SystemExit(f"Build output not found: {binary}")
+
+          archive = dist / (
+              f"candlec-{os.environ['VERSION']}-"
+              f"{os.environ['TARGET_NAME']}.zip"
+          )
+
+          files = [
+              binary,
+              root / "LICENSE",
+              root / "README.md",
+          ]
+
+          with zipfile.ZipFile(
+              archive, "w", compression=zipfile.ZIP_DEFLATED
+          ) as zf:
+              for file in files:
+                  if file.is_file():
+                      zf.write(file, file.name)
+
+          print(f"Created {archive}")
+          PY
+
+      - name: Upload build archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: candlec-${{ matrix.target }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download all archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          pattern: candlec-*
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        working-directory: release-assets
+        run: sha256sum *.zip > SHA256SUMS.txt
+
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/*.zip
+            release-assets/SHA256SUMS.txt
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+
+  update-homebrew-tap:
+    name: Update Homebrew Formula
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo Candle-Ecosystem/candlec \
+            --pattern SHA256SUMS.txt \
+            --dir "$RUNNER_TEMP/release"
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: Candle-Ecosystem/homebrew-candle
+          ref: main
+          path: homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+
+      - name: Generate formula
+        env:
+          TAG: ${{ github.ref_name }}
+          CHECKSUM_FILE: ${{ runner.temp }}/release/SHA256SUMS.txt
+        run: |
+          python - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          version = tag.removeprefix("v")
+          checksums = {}
+
+          for line in Path(os.environ["CHECKSUM_FILE"]).read_text().splitlines():
+              if line.strip():
+                  digest, filename = line.split(maxsplit=1)
+                  checksums[filename.lstrip("*")] = digest
+
+          def asset(target):
+              filename = f"candlec-{tag}-{target}.zip"
+              if filename not in checksums:
+                  raise SystemExit(f"Missing checksum: {filename}")
+
+              url = (
+                  "https://github.com/candle-ecosystem/candlec/"
+                  f"releases/download/{tag}/{filename}"
+              )
+              return url, checksums[filename]
+
+          mac_arm = asset("macos-aarch64")
+          mac_intel = asset("macos-x86_64")
+          linux_arm = asset("linux-aarch64-glibc")
+          linux_intel = asset("linux-x86_64-glibc")
+
+          template = '''class __CLASS__ < Formula
+            desc "Compiler for CASM"
+            homepage "https://candle.nozyx.dev"
+            version "__VERSION__"
+
+            on_macos do
+              if Hardware::CPU.arm?
+                url "__MAC_ARM_URL__"
+                sha256 "__MAC_ARM_SHA__"
+              else
+                url "__MAC_INTEL_URL__"
+                sha256 "__MAC_INTEL_SHA__"
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.arm?
+                url "__LINUX_ARM_URL__"
+                sha256 "__LINUX_ARM_SHA__"
+              else
+                url "__LINUX_INTEL_URL__"
+                sha256 "__LINUX_INTEL_SHA__"
+              end
+            end
+
+            def install
+              prefix.install Dir["*"]
+              bin.install_symlink prefix/"candlec" => "__EXECUTABLE__"
+            end
+
+            test do
+              assert_predicate prefix/"candlec", :executable?
+            end
+          end
+          '''
+
+          replacements = {
+              "__VERSION__": version,
+              "__MAC_ARM_URL__": mac_arm[0],
+              "__MAC_ARM_SHA__": mac_arm[1],
+              "__MAC_INTEL_URL__": mac_intel[0],
+              "__MAC_INTEL_SHA__": mac_intel[1],
+              "__LINUX_ARM_URL__": linux_arm[0],
+              "__LINUX_ARM_SHA__": linux_arm[1],
+              "__LINUX_INTEL_URL__": linux_intel[0],
+              "__LINUX_INTEL_SHA__": linux_intel[1],
+          }
+
+          def generate_formula(class_name, executable_name):
+              formula = template
+              values = {
+                  **replacements,
+                  "__CLASS__": class_name,
+                  "__EXECUTABLE__": executable_name,
+              }
+              for key, value in values.items():
+                  formula = formula.replace(key, value)
+              return formula
+
+          formula_dir = Path("homebrew-tap/Formula")
+          formula_dir.mkdir(parents=True, exist_ok=True)
+
+          # Latest version: brew install candlec
+          (formula_dir / "candlec.rb").write_text(
+              generate_formula("Candlec", "candlec")
+          )
+
+          # Versioned release: brew install candlec@1.0.1
+          class_suffix = re.sub(r"[^A-Za-z0-9]", "", version)
+          versioned_class = f"CandlecAT{class_suffix}"
+          versioned_path = formula_dir / f"candlec@{version}.rb"
+
+          versioned_path.write_text(
+              generate_formula(versioned_class, f"candlec-{version}")
+          )
+
+          print(f"Generated latest formula for Candlec {version}")
+          print(f"Generated versioned formula: {versioned_path}")
+          PY
+
+      - name: Commit and push formula
+        working-directory: homebrew-tap
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          VERSION="${TAG#v}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add Formula/candlec.rb
+          git add "Formula/candlec@${VERSION}.rb"
+
+          if git diff --cached --quiet; then
+            echo "Formulae are already up to date."
+            exit 0
+          fi
+
+          git commit -m "chore: update candlec formulae for ${TAG}"
+          git push origin main

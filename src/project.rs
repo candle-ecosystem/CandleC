@@ -122,6 +122,17 @@ struct Reachability {
     functions: HashSet<Key>,
     modules: HashSet<String>,
     resources: HashSet<String>,
+    signatures: Vec<SignatureCheck>,
+}
+
+struct SignatureCheck {
+    module: String,
+    function: String,
+    index: usize,
+    expected: usize,
+    actual: usize,
+    target: String,
+    closure: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -133,7 +144,7 @@ enum AbstractValue {
 
 fn register(o: &parser::Operand) -> Option<u8> {
     match o {
-        parser::Operand::Register(r) => Some(*r),
+        parser::Operand::Register(r) if *r != 255 => Some(*r),
         parser::Operand::SelfLit => Some(0),
         _ => None,
     }
@@ -229,10 +240,13 @@ fn analyze(
     let mut modules = HashSet::from([main.to_string()]);
     let mut resources = HashSet::new();
     let mut pending_functions = VecDeque::from([main_key]);
+    let mut analyzed = HashSet::new();
+    let mut signatures = Vec::new();
     while let Some(key) = pending_functions.pop_front() {
-        if !functions.insert(key.clone()) {
+        if !analyzed.insert(key.clone()) {
             continue;
         }
+        functions.insert(key.clone());
 
         let Some(function) = all.get(&key) else {
             continue;
@@ -356,6 +370,7 @@ fn analyze(
                 }
             }
 
+            regs.insert(0, HashSet::from([AbstractValue::Module(key.0.clone())]));
             match instruction.name.as_str() {
                 "jmp" => {
                     if let Some(delta) = jump_delta(o) {
@@ -379,6 +394,53 @@ fn analyze(
             }
         }
 
+        for (index, state) in &incoming {
+            let instruction = &function.instructions[*index];
+            let (target_index, fixed, closure) = match instruction.name.as_str() {
+                "call" => (1, 2, false),
+                "pcall" => (2, 3, false),
+                "closure_new" => (1, 2, true),
+                _ => continue,
+            };
+            if instruction.operands.len() < fixed {
+                continue;
+            }
+            let Some(targets) = instruction
+                .operands
+                .get(target_index)
+                .and_then(register)
+                .and_then(|r| state.get(&r))
+            else {
+                continue;
+            };
+
+            if targets.len() != 1 {
+                continue;
+            }
+            let Some(AbstractValue::Function(module, name)) = targets.iter().next() else {
+                continue;
+            };
+            let Some(target) = all.get(&(module.clone(), name.clone())) else {
+                continue;
+            };
+            let expected = if closure {
+                target.captures
+            } else {
+                target.params
+            } as usize;
+            let actual = instruction.operands.len() - fixed;
+            if actual != expected {
+                signatures.push(SignatureCheck {
+                    module: key.0.clone(),
+                    function: key.1.clone(),
+                    index: *index,
+                    expected,
+                    actual,
+                    target: format!("{module}::{name}"),
+                    closure,
+                });
+            }
+        }
         if unknown_call {
             for k in all.keys() {
                 pending_functions.push_back(k.clone());
@@ -391,6 +453,7 @@ fn analyze(
         functions,
         modules,
         resources,
+        signatures,
     })
 }
 
@@ -501,6 +564,51 @@ fn report_warnings(reporter: &mut Reporter, diagnostics: Vec<diagnostic::Diagnos
     }
 }
 
+fn report_signatures(
+    reporter: &mut Reporter,
+    reachable: &Reachability,
+    programs: &HashMap<String, parser::Program>,
+    paths: &HashMap<String, PathBuf>,
+) {
+    let mut checks: Vec<_> = reachable.signatures.iter().collect();
+    checks
+        .sort_by(|a, b| (&a.module, &a.function, a.index).cmp(&(&b.module, &b.function, b.index)));
+    for check in checks {
+        let instruction = &programs[&check.module]
+            .functions
+            .iter()
+            .find(|f| f.name == check.function)
+            .unwrap()
+            .instructions[check.index];
+        let file = paths.get(&check.module).map(|p| p.display().to_string());
+        if check.closure {
+            reporter.error(
+                "E_CAPTURE_COUNT",
+                format!(
+                    "'{}' expects exactly {} captures, but {} were supplied",
+                    check.target, check.expected, check.actual
+                ),
+                file,
+                instruction.line,
+                instruction.column,
+            );
+        } else if check.actual > check.expected {
+            reporter.warning(
+                "W_EXTRA_ARGUMENTS",
+                format!(
+                    "'{}' expects {} parameters, but {} were supplied; extra parameters will be ignored",
+                    check.target, check.expected, check.actual
+                ),
+                file,
+                instruction.line,
+                instruction.column,
+            );
+        } else {
+            reporter.warning("W_MISSING_ARGUMENTS", format!("'{}' expects {} parameters, but {} were supplied; missing parameters will be filled with void", check.target, check.expected, check.actual), file, instruction.line, instruction.column);
+        }
+    }
+}
+
 pub fn build(root: &Path, reporter: &mut Reporter) -> Result<PathBuf, String> {
     let c = Config::read(root)?;
     if !c.source.is_dir() {
@@ -578,6 +686,34 @@ pub fn build(root: &Path, reporter: &mut Reporter) -> Result<PathBuf, String> {
     }
 
     let reachable = analyze(&c.main_module, &programs)?;
+    report_signatures(reporter, &reachable, &programs, &paths);
+    if reporter.has_errors() {
+        return Err(diagnostic::ALREADY_REPORTED.into());
+    }
+
+    for check in &reachable.signatures {
+        if !check.closure {
+            let program = programs.get_mut(&check.module).unwrap();
+            let function = program
+                .functions
+                .iter_mut()
+                .find(|f| f.name == check.function)
+                .unwrap();
+            let instruction = &mut function.instructions[check.index];
+            if check.actual < check.expected {
+                instruction.operands.extend(std::iter::repeat_n(
+                    parser::Operand::Void,
+                    check.expected - check.actual,
+                ));
+            } else {
+                let fixed = if instruction.name == "pcall" { 3 } else { 2 };
+                instruction.operands.truncate(fixed + check.expected);
+            }
+        }
+    }
+    for module in &mut modules {
+        module.functions = compiler::compile(&programs[&module.name]).map_err(|e| e.to_string())?;
+    }
     let reachable_functions = reachable.functions.clone();
     let reachable_modules = reachable.modules.clone();
     let reachable_resources = reachable.resources.clone();
@@ -774,6 +910,7 @@ pub fn check(root: &Path, reporter: &mut Reporter) -> Result<(), String> {
     } else {
         fallback_reachability = Reachability {
             functions: HashSet::new(),
+            signatures: Vec::new(),
             modules: programs.keys().cloned().collect(),
             resources: resource_files
                 .iter()
@@ -782,6 +919,13 @@ pub fn check(root: &Path, reporter: &mut Reporter) -> Result<(), String> {
         };
         fallback_reachability
     };
+    if !parse_failed
+        && !uncertain_structure
+        && uncertain_functions.is_empty()
+        && !analysis_unavailable
+    {
+        report_signatures(reporter, &reachable, &programs, &paths);
+    }
     let mut warnings = analysis_diagnostics(
         &c,
         &programs,
